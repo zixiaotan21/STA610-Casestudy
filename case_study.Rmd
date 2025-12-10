@@ -1,0 +1,1001 @@
+---
+title: "Sta 610: Case Study"
+author: "Zixiao Tan"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: false
+    number_sections: false
+geometry: margin=0.8in
+fontsize: 10pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.align = 'center')
+```
+
+
+
+```{r, warning=FALSE}
+library(tidyverse)
+library(lme4)
+library(rstan)
+library(brms)
+library(knitr)
+library(kableExtra)
+library(patchwork)
+library(lubridate)
+library(gridExtra)
+library(influence.ME)
+
+options(scipen = 0, digits = 4)
+ggplot2::theme_set(ggplot2::theme_bw())
+```
+
+
+```{r}
+#load data
+load("streetrx.RData")
+
+# GROUP 5 - diazepam
+# filter data for only diazepam
+streetrx <- streetrx %>%
+  filter(api_temp == "diazepam")
+```
+
+# Abstract
+
+This study is going to explore the relationship between the price per mg of diazepam and other factors related to the sale using the StreetRx data. We investigate factors related to the price per mg of Diazepam, accounting for potential clustering by location and exploring heterogeneity in pricing by location. Our data contains the following factors, and we will explore how the factors in the dataset are or are not associated with pricing per milligram. We are going to answer these
+research questions:
+
+* Which variables are associated with pricing per milligram of Diazepam?
+* Is there heterogeneity in pricing of Diazepam by location? 
+
+# Data Cleaning
+
+#### Missing Data
+
+We first examine missing data patterns in the dataset. Since ppm is our response variable, we remove all observations with missing ppm values, as it is nonsensical to include observations without a response.
+
+The primary_reason variable has over 50% missing observations, making it unsuitable for modeling. We therefore exclude this variable from our analysis. Additionally, since all purchases were made in the USA, we do not consider the country variable.
+
+
+#### Data Entry Errors
+
+We identify data entry errors in the source variable, specifically two observations with values "fuck u" and "Eronhkkjhhhhjj". These observations are removed from the dataset.
+
+
+
+
+
+
+
+```{r}
+# variable description table
+tibble(Variable = names(streetrx),
+Description = c("Price per mg (outcome of interest)",
+                "	Year and quarter drug was purchased",
+                "Date of the reported purchase
+",
+                "city purchased",
+                "state purchased",
+"country purchased",
+"northeast, midwest, west, south, or other/unknown
+",
+"source of information",
+"active ingredient of drug of interest, in our case Diazepam)
+",
+"formulation of the drug (e.g., pill, patch, suppository)
+",
+"dosage strength in mg of the units purchased
+",
+"indicator for purchase of 10+ units at once
+",
+"primary reason for purchase"
+)) %>%
+  kable(caption = "Variable Descriptions", booktabs = TRUE)
+```
+
+```{r}
+# code missing data
+streetrx <- data.frame(apply(streetrx, 2, function(x) gsub("^$|^ $", NA, x)))
+
+# table of variables with missing data
+# tibble(
+#   Variable = names(streetrx), 
+#   `Number Missing` = apply(streetrx, 2, function(x) sum(is.na(x))),
+#   `Proportion Missing` = apply(streetrx, 2, function(x) mean(is.na(x)))
+# ) %>%
+#   kable(caption = "Number of observations missing per variable") %>%
+#   kable_styling(latex_options = "HOLD_position")
+
+# code factors and numeric variables 
+streetrx <- streetrx %>%
+  mutate(ppm = as.numeric(ppm), 
+         yq_pdate = as.numeric(yq_pdate),
+         price_date = mdy(price_date),
+         city = as.factor(city), 
+         state = as.factor(state),
+         country = as.factor(country),
+         USA_region = as.factor(USA_region),
+         source = as.factor(source),
+         form_temp = as.factor(form_temp),
+         mgstr = as.numeric(mgstr),
+         bulk_purchase = as.factor(bulk_purchase),
+         Primary_Reason = as.factor(Primary_Reason)
+         )
+
+# add year
+streetrx <- streetrx %>%
+  mutate(year = year(price_date))
+
+# delete observations with missing ppm data
+streetrx <- streetrx %>%
+  filter(!is.na(ppm))
+
+# remove data entry errors in source variable
+streetrx <- streetrx %>%
+  filter(!(source %in% c("fuck u", "Eronhkkjhhhhjj")))
+
+# delete levels of mgstr that are not 2, 4, 5, 10
+streetrx <- streetrx %>%
+  filter(mgstr %in% c(2,4,5,10)) %>%
+  mutate(mgstr = as.factor(mgstr))
+
+# delete year of 1969 as it is likely an error
+streetrx <- streetrx %>%
+  filter(year != 1969)
+
+# delete state = USA
+streetrx <- streetrx %>%
+  filter(state != "USA")
+
+#combine all website sources as being Internet source
+streetrx <- streetrx %>%
+  mutate(source = as.character(source)) %>%
+  mutate(source = if_else(str_detect(source, "http://"), "Internet", source)) %>%
+  mutate(source = if_else(str_detect(source, ".com$"), "Internet", source)) %>%
+  mutate(source = if_else(source == "Streetrx", "Internet",source)) %>%
+  mutate(source = if_else(source ==  "Poopy,", "N/A", source)) %>%
+  mutate(source = if_else(source == "google", "Internet", source)) %>%
+  mutate(source = if_else(source == "Internet Pharmacy", "Internet", source)) %>%
+  mutate(source = na_if(source, "N/A")) %>%
+  mutate(source = na_if(source, "None")) %>%
+  mutate(source = as.factor(source))
+
+# remove states with 1 observation
+streetrx <- streetrx %>%
+  group_by(state) %>%
+  count() %>%
+  filter(n > 1) %>%
+  select(state) %>%
+  left_join(streetrx, by = "state")
+```
+
+# EDA
+
+#### Distribution of outcome variable (ppm)
+
+We note from the below histogram that the distribution of ppm is highly right-skewed. To satisfy the conditional distribution assumption, we aim for ppm to be normally distributed and symmetric. This of course only examines the marginal distribution of ppm, but the idea is that this may carry over into the conditional distribution, which we examine after the model fitting process.
+
+We choose to do a log transformation of ppm. We can that the histogram of log(ppm) is relatively normally distributed and symmetric. Using a log transformation is a good choice as well because our raw data ppm observation are all greater than 0, and log transformations are still easily  interpretable, which is important in this case study. 
+
+```{r, fig.height=2}
+ppm_hist1 <- streetrx %>%
+  ggplot(aes(x = ppm, y = ..density..)) +
+  geom_histogram(alpha = 0.4, fill=rainbow(30), bins=30, color = "black") +
+  geom_density(color = "black", adjust = 5)
+
+ppm_hist2 <- streetrx %>%
+  ggplot(aes(x = log(ppm), y = ..density..)) +
+  geom_density(color = "black", adjust = 5) +
+  geom_histogram(alpha = 0.4, fill=rainbow(20), bins=20, color = "black")
+
+patchwork <- ppm_hist1 + ppm_hist2
+
+patchwork + plot_annotation(
+  title = "Distribution of ppm and log(ppm)")
+```
+
+### Random Intercept
+
+#### State
+To address our research question on heterogeneity in Diazepam pricing by location, we include a random intercept by state. The boxplot below demonstrates notable variation in log(ppm) across states, supporting the use of state as our grouping variable for the random intercept.
+
+```{r, fig.height=4}
+ggplot(streetrx, aes(x = state, y = log(ppm))) +
+  geom_boxplot(aes(fill = factor(state)), outlier.size = 0.1) +
+  labs(title = "Log(ppm) by state",
+       x = "State") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 7))
+```
+
+```{r, fig.height=5, fig.width=5}
+ggplot(streetrx, aes(x = log(ppm), y = state)) +
+  geom_boxplot(aes(fill = factor(state)), outlier.size = 0.1) +
+  labs(title = "Log(ppm) by state (vertical orientation)",
+       y = "State",
+       x = "Log(ppm)") +
+  theme(legend.position = "none",
+        axis.text.y = element_text(size = 7))
+```
+
+#### Region
+
+We also examine the variation in log(ppm) across USA regions. The boxplot below shows that there is minimal variation across regions, with similar distributions and medians. Given this lack of substantial heterogeneity by region, we choose to include a random intercept by state rather than region in our model, as state provides more meaningful geographic variation.
+
+```{r, fig.height=2.5}
+ggplot(streetrx, aes(x = USA_region, y = log(ppm))) +
+  geom_boxplot(aes(fill = factor(USA_region)), outlier.size = 0.1) +
+  labs(title = "Log(ppm) by region",
+       x = "Region") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+### Fixed Effect
+
+Our second research question implores us to understand which variables are associated with pricing per milligram of Diazepam. We thus would like to include some fixed effects in our model that allow us to explore these associations. Through EDA, we assess relationships of variables in our dataset with log(ppm), which is useful to understand which variables may be most helpful to include as fixed effects in our model.
+
+
+
+#### year
+
+The boxplot below shows variation in log(ppm) across years, suggesting a temporal relationship. Including year as a fixed effect is also important to account for potential price inflation over time. We therefore include year in our model selection process.
+
+```{r, fig.height=2.5}
+streetrx %>%
+  mutate(
+    year = yq_pdate %/% 10,
+    quarter = yq_pdate %% 10
+  ) %>%
+  filter(year > 2009) %>%
+  ggplot(., aes(x = factor(year), y = log(ppm))) +
+  geom_boxplot(aes(fill = factor(year)), outlier.size = 0.1) +
+  labs(title = "Log(ppm) by year",
+       x = "Year") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+#### mgstr, bulk_purchase, and source
+
+We next assess the relationship of mgstr, bulk_purchase, and source by log(ppm) in the below boxplots. We see that all of these variables seem to have differences in log(ppm) by their respective levels, thus we choose to include mgstr, bulk_purchase, and source as fixed effects in our model selection process.
+
+
+Most mgstr (dosage strength) values are either 2, 4, 5, or 10 mg. We remove observations with other dosage values and code mgstr as a factor variable with four levels.
+
+
+```{r, fig.height=3.5}
+mgstr_ppm <- ggplot(streetrx, aes(x = factor(mgstr), y = log(ppm))) + 
+    geom_boxplot(aes(fill = factor(mgstr)), outlier.size = 0.1) + 
+  labs(x = "mgstr") + 
+  theme(legend.position = "none") +
+  coord_flip()
+
+bp_ppm <- ggplot(streetrx, aes(x = bulk_purchase, y = log(ppm))) + 
+    geom_boxplot(aes(fill = bulk_purchase), outlier.size = 0.1) + 
+  labs(x = "Bulk Purchase") + 
+  theme(legend.position = "none") + 
+  coord_flip()
+
+source_ppm <- ggplot(streetrx, aes(x = source, y = log(ppm))) + 
+    geom_boxplot(aes(fill = source), outlier.size = 0.1) + 
+  labs(x = "Source") + 
+  theme(legend.position = "none") +
+  coord_flip()
+
+patchwork <- mgstr_ppm / bp_ppm / source_ppm
+
+patchwork + plot_annotation(
+  title = "Log(ppm) vs. mgstr, bulk purchase, and source")
+```
+
+We note that form_temp (formulation of the drug as pill, patch, etc.) is always pill for Diazepam, so we do not consider it as a potential variable in our model. The last variable in our dataset is primary reason for the purchase of Diazepam. We note in the data cleaning section that this variable contains many missing observations, so we choose to exclude it. 
+
+### Random Slopes
+
+We next assess whether random slopes of our chosen variables by state would be useful. We note that we only have one continuous variable, year. To evaluate random slopes through EDA, we do not examine the trend of variables by all states. Instead, we filter for states with larger than 30 observations, and then choose a random sample of 8 states. We first examine the trend of the relationship of year with log(ppm) across 8 random states, and find that there is no distinguishable difference so we choose not to include a random slope of year by state (see plot in appendix). 
+
+We then examine differences in the levels of mgstr, source, and bulk_purchase vs. log(ppm) by state. We created boxplots of each level of mgstr, source, and bulk_purchase vs. log(ppm) by state and did not find evidence of any major difference between the levels of the factors vs. log(ppm) by state. Thus we choose not to include any random slopes in our model. The boxplots can be found in the appendix. 
+
+#### Interactions
+
+We assess whether 2-way interactions among our candidate fixed effects would improve the model. EDA reveals some evidence for `bulk_purchase:mgstr` and `source:mgstr` interactions, though the evidence is not strong and may be influenced by sparse observations in certain combinations. Interactions with `year` show no substantial evidence. To ensure we do not miss important interactions, we include all 2-way interactions among our fixed effects (`year`, `mgstr`, `bulk_purchase`, `source`) in the exhaustive search, allowing BIC to determine which, if any, should be retained. 
+
+# Model Building and Selection
+
+#### Model Selection
+
+Through EDA, we have made the decision to include a random intercept by state in our model selection process, as well as fixed effects for `year`, `mgstr`, `bulk_purchase` and `source`. To simplify the modeling while still being able to interpret uncertainty, we decide to use a two phase process. First, we run an exhaustive search on all models that include our desired fixed/main effects, random intercept for `state`, and all 2-way interactions. This gives $2^10 = 1024$ models to select from, and we then select the model in the lowest BIC as our final model. We do note that many models that are fit through exhaustive search do not have good interpretability (ex. models that include a two-way interaction but exclude the corresponding main effects). Thus, we fit all 1024 models, but select the final model with the smallest BIC among all the models that include all main effects where a two-way interaction exists. The table below shows the top 10 models with the lowest BIC from our exhaustive search.
+
+
+```{r}
+exhaustive_search <- function(raw_model, vars, data, REML = F) {
+  y_name <- deparse(raw_model[[2]])
+  group_name <- deparse(raw_model[[3]])
+  id <- 0 : (2^length(vars) - 1)
+  construct_model <- function(.id){
+    subset <- (.id %/% 2^(0:(length(vars) - 1))) %% 2 == 1
+    if (all(subset == F)){
+      RHS <- paste0(c("1", group_name), collapse = ' + ')
+    }
+    else {
+      RHS <- paste0(c(vars[subset], group_name), collapse = ' + ')
+    }
+    paste(y_name, RHS, sep = ' ~ ')
+  }
+  run_model <- function(.id){
+    model_str <- construct_model(.id)
+    model_formula <- as.formula(model_str)
+    res <- lmer(model_formula, REML = REML, data = data)
+    return (summary(res)$AICtab)
+  }
+  
+  bind_cols(
+    model = sapply(id, construct_model),
+    as.data.frame(t(sapply(id, run_model)))
+  )
+}
+```
+
+```{r, message = F, echo = F}
+ex_result_int <- exhaustive_search(
+  raw_model <- log(ppm) ~ (1 | state),
+  vars = c("year", "mgstr", "bulk_purchase", "source", 
+           "year:mgstr", "year:bulk_purchase", "year:source",
+           "mgstr:bulk_purchase", "mgstr:source", "bulk_purchase:source"),
+  data = streetrx,
+  REML = F
+)
+```
+
+```{r, echo = F}
+ex_result_int %>% arrange(BIC) %>% head(10) %>%
+  select(1, 3) %>%
+  kbl(caption = "Exhaustive search of fixed effects using BIC", booktabs = TRUE)
+```
+
+
+Our best model with the lowest BIC is:
+
+$$
+\begin{aligned}
+Y_{ij} = \mu &+ \alpha_{j} + \beta_1\mathbb{I}(\mathrm{mgstr}_{ij} = 4) + \beta_2\mathbb{I}(\mathrm{mgstr}_{ij} = 5) + \beta_3\mathbb{I}(\mathrm{mgstr}_{ij} = 10) \\
+&+ \beta_4\mathbb{I}(\mathrm{bulkp}_{ij} = 1) + \beta_5\mathbb{I}(\mathrm{source}_{ij} = \mathrm{internet}) + \beta_6\mathbb{I}(\mathrm{source}_{ij} = \mathrm{personal}) + \epsilon_{ij},
+\end{aligned}
+$$
+
+$$
+\begin{aligned}
+\alpha_j &\stackrel{iid}{\sim} \mathrm{Normal}(0, \tau^2), \\
+\epsilon_{ij} &\stackrel{iid}{\sim} \mathrm{Normal}(0, \sigma^2),
+\end{aligned}
+$$
+where $Y_{ij}$ is the log(ppm) for purchase $i$ in state $j$, and $\mathrm{mgstr}_{ij}$, $\mathrm{bulkp}_{ij}$, and $\mathrm{source}_{ij}$ are fixed effects. The reference level for mgstr is 2mg, for bulk purchase is 0 (non-bulk), and for source is "Heard of".
+
+```{r, include=FALSE}
+best_model <- ex_result_int %>% arrange(BIC) %>% .[1, "model"]
+res <- lmer(as.formula(best_model), REML = F, data = streetrx)
+summary(res)
+```
+
+#### Frequentist vs. Bayesian Model
+
+In the 2nd phase of our model build, we run both a frequentist and Bayesian hierarchical model to estimate the parameters, including the coefficients and the variances. We found that estimates from the Bayesian version of our model were very similar to the frequentist model we fitted, so we proceeded to interpret the frequntist model that we fitted above. The Bayesian model estimates and posterior distributions can be found in the appendix.
+
+## Bayesian Model Comparison
+
+### Model Fitting
+
+Here we impose a prior on the parameters and fit the model using a Bayesian approach to see if we have differing estimates from the frequentist version. Since we do not have much information about the model, we used non-informative priors. We choose not to employ an empirical bayes approach here, as we want to be careful about using the data to inform our priors. 
+
+$$
+\begin{aligned}
+\beta_j &\stackrel{iid}{\sim}\mathrm{Normal}(0,1) \\
+\tau^2 &\sim \mathrm{InvGamma}(0.1, 0.1) \\
+\sigma^2 &\sim \mathrm{InvGamma}(0.1, 0.1)
+\end{aligned}
+$$
+
+```{r, message = F}
+priors <- c(
+  set_prior("normal(0, 1)", class = 'b'),
+  set_prior("inv_gamma(0.1, 0.1)", class = "sd", group = "state"),
+  set_prior("inv_gamma(0.1, 0.1)", class = 'sd')
+)
+
+bayes_result <- brm(as.formula(best_model), data = streetrx, prior = priors,
+                    verbose = F, refresh = 0)
+```
+
+#### Estimates Comparison
+
+In the below table, we compare the point estimates of the parameters from the frequentist model and posterior means of the parameters from the Bayesian model. We can see that the results given in the Bayesian setting are almost the same as those from the frequentist setting. We show the plots of the posterior distributions for all parameters in the appendix, and note that the traceplots suggest that the sampling chains converge.
+
+```{r}
+
+bayes_fixed <- (summary(bayes_result)$fixed) %>%
+  select("Estimate") %>%
+  rename("Bayesian Model Esimate" = "Estimate")
+
+freq_est <- as.matrix(coef(summary(res))[,1])
+colnames(freq_est)[[1]] <- "Frequentist Model Estimate"
+
+
+
+cbind(freq_est, bayes_fixed) %>%
+  knitr::kable(caption = "Fixed effect estimates comparison", booktabs = TRUE) 
+
+bayesian_var <- rbind(summary(bayes_result)$spec_pars %>%
+  select("Estimate"),
+  summary(bayes_result)$random$state %>% select("Estimate")) %>%
+  mutate(Estimate = Estimate^2) %>%
+  rename("Bayesian Model Estimate" = "Estimate")
+
+rownames(bayesian_var) <- c("Residual", "State")
+
+frequentist_est <- as.data.frame(VarCorr(res)) %>%
+  select(1, 4) %>%
+  rename(var = vcov) %>%
+  rename("Frequentist Model Estimate" = var) %>%
+  select("Frequentist Model Estimate")
+  
+
+rownames(frequentist_est) <- c("State", "Residual")
+
+merge(bayesian_var, frequentist_est, by = "row.names") %>%
+  rename("Source of Variation" = "Row.names") %>%
+  knitr::kable(caption = "Variance estimates comparison", booktabs = TRUE)
+```
+
+
+# Interpretation of results (frequentist model)
+
+### Fixed effects
+
+```{r}
+coef(summary(res)) %>%
+  knitr::kable(caption = "Fixed effect estimates on log scale", booktabs = TRUE)
+```
+
+
+First, we note that each estimate in our model is significant with a 5% significance level.
+Therefore we have identified a relationship between `mgstr`, `bulk_purchase`, and `source`
+and the price per mg of diazepam. Below we interpret these relationships.
+
+As we took the log of our response ppm, we must exponentiate our estimates in order to interpret the effect of each variable on `ppm`. The following results are:
+
+* Grand mean: Our estimated grand mean for `ppm` represents the average
+price per mg of diazepam across all states for the reference dosage level (2mg), cases where the purchase was heard of, and non bulk purchases.
+
+* `mgstr`: On average, we expect an increase in dosage from
+2 mg to 5 mg or from 2 mg to 10 mg to affect the price per mg. The specific effects will depend on the model estimates.   
+
+* `bulk_puchase`: On average bulk purchases are 12.41% cheaper, in terms of price per mg, 
+than non bulk purchases.
+
+* `source`: Purchases that were personally reported are on average 10% less
+price per mg than purchases that had been heard second hand, while we expect a purchase that was discovered through the internet to be 33% less price per mg than a purchase that had been heard second hand.
+
+
+### Random effects
+
+The following illustrates the sorted estimated random state intercepts with 
+95% confidence intervals.
+
+```{r, fig.height=5}
+# dotplot
+library(lattice)
+dotplot(ranef(res, condVar = TRUE), font.size = 5, rotate = TRUE)$state
+```
+
+Overall the plot demonstrates significant heterogeneity across states in the baseline ppm of diazepam for the reference conditions (2mg dosage, non-bulk purchases, and purchases reported by word of mouth). States with confidence intervals that do not contain 0 show a significant difference from the grand mean, indicating meaningful variation in baseline pricing across locations. 
+
+
+```{r}
+as.data.frame(VarCorr(res)) %>%
+  select(1, 4) %>%
+  rename(var = vcov) %>%
+  knitr::kable(caption = "Variance estimates", booktabs = TRUE)
+```
+
+The variance estimates show the decomposition of variability in log(ppm) between and within states. While there is some across-state variance, the within-state variance is considerably larger, indicating substantial unexplained variation within states that our model does not capture.
+
+
+# Model Diagnostics and Limitations 
+
+There are a few limitations to note with our model. As mentioned above, our across-state variance is much smaller than within-state variance, meaning that there is still much within-group variance that our model is unable to explain. Additionally, there are issues with the normality assumption as well as outliers explained below.  
+
+#### Residual Analysis
+
+Through examining our residuals we can determine how well our model assumptions hold. The plot of our residual against the fitted values are somewhat reassuring (see appendix). Aside for a couple points that appear to be potential outliers, we observed that the constant variance and linearity conditions are met. It is possible that the two outliers contribute to our larger within state variance, though this is something we do not explore in this analysis. 
+
+The normality assumption is not met, as the distribution of the residuals appears to have fatter tails, particularly on the left side of the distribution where a few outliers are present. With that being said, the density of the residuals is fairly symmetric and centered at 0 (see appendix for plot).
+
+#### Influential Groups
+
+Now we take steps to determine if there are influential groups that might be effecting our model assumptions. First we look at the DFBETAS of each parameter for each state. Following this, we use Cook's distance as another criteria to determine if there are cases of influential states.    
+
+There are 14 states such that at least one parameter had a standardized difference in their estimate that exceeded our cutoff when excluding that state. Note that many of the states included have the largest sample sizes in the data set. These include California, Texas, and New York. A table of states and their corresponding DFBETAS for each variable can be seen in the appendix.
+
+When examining Cook's distance, Texas is the only state that exceeds the cutoff and can be considered influential. This is not surprising as Texas had multiple parameters with DFBETAS that exceeded the cutoff and Cook's distance is a summary measure of how an observation influences all parameter estimates. While, it seems Texas is an influential group we have yet to determine if it is an outlier as well. At the same time, Texas has the third largest sample size in the data set and clearly a state we would want to include in the analysis so it does not make sense to consider deleting this group.
+
+\newpage
+
+# Appendices
+
+We include both a Code Appendix and a Plot Appendix
+
+# Code Appendix
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+
+```
+
+
+
+# Plot Appendix
+
+## Additional EDA
+
+### Random Intercepts 
+
+```{r}
+ggplot(streetrx, aes(x = USA_region, y = log(ppm))) + 
+  geom_boxplot(aes(fill = factor(USA_region)), outlier.size = 0.1) + 
+  labs(title = "Log(ppm) by region", 
+       x = "Region") + 
+  theme(legend.position = "none", 
+                axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+
+### Fixed effects vs. log(ppm)
+
+Dates
+
+```{r}
+# two dates are consistent
+
+streetrx %>% filter(yq_pdate >= 20000) %>%
+  mutate(year = yq_pdate %/% 10) %>%
+  ggplot() + 
+  geom_boxplot(aes(x = year, y = log(ppm), group = year))
+
+streetrx %>% 
+  filter(yq_pdate >= 20000) %>%
+  mutate(days = difftime(price_date, '2000-01-01', units = "days")) %>%
+  ggplot() +
+  geom_point(aes(x = days, y = log(ppm)))
+
+streetrx %>% 
+  filter(yq_pdate >= 20090) %>%
+  mutate(days = difftime(price_date, '2000-01-01', units = "days")) %>%
+  ggplot() +
+  geom_point(aes(x = days, y = log(ppm)))
+```
+
+
+Geographical Information
+
+```{r}
+###### GEOGRAPHICAL INFORMATION ######
+
+ggplot(streetrx, aes(x = USA_region, y = log(ppm))) + 
+  geom_boxplot(aes(fill = factor(USA_region))) + 
+  labs(title = "Relationship between region and log(ppm)", 
+       x = "Region") + 
+  theme(legend.position = "none")
+
+```
+
+
+Form_temp
+
+```{r}
+###### form_temp ######
+streetrx %>% group_by(form_temp) %>% summarize(n = n())
+streetrx %>% group_by(form_temp, is.na(mgstr)) %>% summarize(n = n())
+# All syrup/liquid rows do not have `mgstr` values. Basically we do not have any outcome data for syrup/liquid drugs
+```
+
+
+Quarter 
+
+```{r}
+###### Quarter
+streetrx %>% mutate(quarter = yq_pdate %% 10) %>%
+  ggplot(aes(fill = factor(quarter))) + 
+  geom_boxplot(aes(x = quarter, y = log(ppm), group = quarter), outlier.size = 0.1) + 
+  theme(legend.position = "none") + 
+  labs(x = "Quarter")
+```
+
+
+### Assessment of Random Slopes
+
+```{r, fig.height=3}
+set.seed(7)
+state_rand <- streetrx %>%
+  group_by(state) %>%
+  count() %>%
+  arrange(desc(n)) %>%
+  filter(n > 30) %>%
+  ungroup() %>%
+  sample_n(8) %>%
+  pull(state)
+
+state_rand <- as.character(state_rand)
+
+streetrx %>%
+  filter(state %in% c(state_rand)) %>%
+  ggplot(., aes(x = year, y = log(ppm))) + 
+  geom_jitter(size = 0.2) + 
+  facet_wrap(~state, ncol = 4) + 
+  labs(title = "Distribution of log(ppm) by year and 8 random states") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+```{r}
+set.seed(7)
+state_rand <- streetrx %>%
+  group_by(state) %>%
+  count() %>%
+  arrange(desc(n)) %>%
+  filter(n > 30) %>%
+  ungroup() %>%
+  sample_n(8) %>%
+  pull(state)
+
+state_rand <- as.character(state_rand)
+
+mgstr_rand_slope <- streetrx %>%
+  filter(state %in% c(state_rand)) %>%
+  ggplot(., aes(x = mgstr, y = log(ppm), fill = mgstr)) + 
+  geom_boxplot() + 
+  facet_wrap(~state, ncol = 4) + 
+  theme(legend.position = "none") + 
+  coord_flip()
+```
+
+
+```{r}
+set.seed(0)
+state_rand <- streetrx %>%
+  group_by(state) %>%
+  count() %>%
+  arrange(desc(n)) %>%
+  filter(n > 30) %>%
+  ungroup() %>%
+  sample_n(8) %>%
+  pull(state)
+
+state_rand <- as.character(state_rand)
+
+source_rand_slope <- streetrx %>%
+  filter(state %in% c(state_rand)) %>%
+  ggplot(., aes(x = source, y = log(ppm), fill = source)) + 
+  geom_boxplot() + 
+  facet_wrap(~state, ncol = 4) + 
+  theme(legend.position = "none") + 
+  coord_flip()
+```
+
+
+```{r}
+set.seed(99)
+state_rand <- streetrx %>%
+  group_by(state) %>%
+  count() %>%
+  arrange(desc(n)) %>%
+  filter(n > 30) %>%
+  ungroup() %>%
+  sample_n(8) %>%
+  pull(state)
+
+state_rand <- as.character(state_rand)
+
+bp_rand_slope <- streetrx %>%
+  filter(state %in% c(state_rand)) %>%
+  ggplot(., aes(x = bulk_purchase, y = log(ppm), fill = bulk_purchase)) + 
+  geom_boxplot() + 
+  facet_wrap(~state) + 
+  theme(legend.position = "none") + 
+  coord_flip()
+```
+
+```{r, fig.height=10}
+patchwork <- mgstr_rand_slope / source_rand_slope / bp_rand_slope
+
+patchwork + plot_annotation(
+  title = "Log(ppm) vs. mgstr, bulk purchase, and source by 8 random states",
+  subtitle = 'We do not observe difference in levels by state',
+)
+```
+
+### Interaction plots
+
+1.) `bulk_purchase` and `mgstr`
+
+The following boxplot does reveal some slight variance in the effect of `bulk_purchace` on `log(ppm)` across values of `mgstr`
+
+```{r}
+ggplot(streetrx) + 
+  geom_boxplot(aes(x = bulk_purchase, y = log(ppm))) +
+  facet_wrap(~mgstr)
+```
+
+
+2.) `source` and `mgstr`
+
+The following boxplot does reveal some slight variance in the effect of `source` on `log(ppm)` across different values of `mgstr`, though some of this effect could be distorted by lack of observations within certain categories.
+
+```{r}
+ggplot(streetrx) + 
+  geom_boxplot(aes(x = source, y = log(ppm))) +
+  facet_wrap(~mgstr)
+```
+
+
+3.) `source` and `bulk_purchase`
+
+The follow boxplot does not show substantial evidence that the relationship between log(ppm) and bulk_purchace varies across source.
+
+```{r}
+ggplot(streetrx) + 
+  geom_boxplot(aes(x = bulk_purchase, y = log(ppm))) +
+  facet_wrap(~source)
+```
+
+
+4.) `bulk_purchase` and `quarter`` ######`
+
+From the boxplot it appears that the relationship between quarter and log(ppm)changes slightly for different values of bulk_purchase.
+
+```{r}
+streetrx %>%
+  mutate(quarter = yq_pdate %% 10) %>%
+  ggplot(aes(x = as.factor(quarter), y = log(ppm))) +
+  geom_boxplot() +
+  facet_wrap(~ bulk_purchase)
+```
+
+
+5.) `mgstr` and `quarter`` #####`
+
+There is some evidence that the effect of quarter on log(ppm) changes with thedosage unit.
+
+```{r}
+streetrx %>%
+  mutate(quarter = yq_pdate %% 10) %>%
+  ggplot(aes(x = as.factor(quarter), y = log(ppm))) +
+  geom_boxplot() +
+  facet_wrap(~ mgstr)
+```
+
+
+
+6.) `source` and `quarter` 
+
+We do not see strong evidence that the relationship between quarter and log(ppm) changes across source.
+
+  
+```{r}
+streetrx %>%
+  mutate(quarter = yq_pdate %% 10) %>%
+  ggplot(aes(x = as.factor(quarter), y = log(ppm))) +
+  geom_boxplot() +
+  facet_wrap(~ source)
+```
+  
+
+7.) Interactions between factor variables and year
+
+7.1) `mgstr` 
+
+There is not strong evidence that `mgstr` effects the relationship between `year` and `log(ppm)`.
+
+```{r}
+streetrx %>% 
+  mutate(year = yq_pdate %/% 10) %>% 
+  ggplot(aes(x=year, y = log(ppm)))  +
+  geom_point() +
+  facet_wrap(~mgstr) + 
+  geom_smooth(method = "lm")  
+
+streetrx %>% 
+  mutate(year = yq_pdate %/% 10) %>% 
+  filter(year > 2005) %>% 
+  ggplot(aes(x=year, y = log(ppm)))  +
+  geom_point() +
+  facet_wrap(~mgstr) + 
+  geom_smooth(method = "lm")  
+```
+
+
+7.2) `bulk_purchase` 
+
+There is not strong evidence that `bulk_purchase` effects the relationship between `year` and `log(ppm)`.
+
+```{r}
+streetrx %>% 
+  mutate(year = yq_pdate %/% 10) %>% 
+  ggplot(aes(x=year, y = log(ppm)))  +
+  geom_point() +
+  facet_wrap(~bulk_purchase) + 
+  geom_smooth(method = "lm")  
+
+
+streetrx %>% 
+  mutate(year = yq_pdate %/% 10) %>% 
+  filter(year > 2005) %>% 
+  ggplot(aes(x=year, y = log(ppm)))  +
+  geom_point() +
+  facet_wrap(~bulk_purchase) + 
+  geom_smooth(method = "lm") 
+```
+
+
+
+7.3) `source` 
+
+There is not strong evidence that `source` effects the relationship between `year` and `log(ppm)`.
+
+```{r}
+streetrx %>% 
+  mutate(year = yq_pdate %/% 10) %>% 
+  ggplot(aes(x=year, y = log(ppm)))  +
+  geom_point() +
+  facet_wrap(~source) + 
+  geom_smooth(method = "lm")  
+
+streetrx %>% 
+  mutate(year = yq_pdate %/% 10) %>% 
+  filter(year > 2005) %>% 
+  ggplot(aes(x=year, y = log(ppm)))  +
+  geom_point() +
+  facet_wrap(~source) + 
+  geom_smooth(method = "lm")  
+```
+
+Outside of `mgstr` and `quarter`,  `bulk_purchase` and `quarter`, `source` and, and `mgstr` `bulk_purchase` and `mgstr` there was not strong evidence for other interaction effects. Even for those listed above the evidence was not substantial in our EDA, and some of the variation is likely due to a lack of observations for certain interaction terms.
+
+## Frequentist Model Output
+
+Fitting the model with frequentist MLE, we have the following results.
+
+```{r, include=FALSE}
+best_model <- ex_result_int %>% arrange(BIC) %>% .[1, "model"]
+res <- lmer(as.formula(best_model), REML = F, data = streetrx)
+summary(res)
+```
+
+
+## Bayesian Model Comparison
+
+### Model Fitting
+
+Here we imposed a prior on the parameters and fit the model using a Bayesian approach to see if we had differing estimates using this approach. Since we did not have much information about the model, we used non-informative priors:
+
+$$
+\begin{aligned}
+\beta_j &\stackrel{iid}{\sim}\mathrm{Normal}(0,1) \\
+\tau^2 &\sim \mathrm{InvGamma}(0.1, 0.1) \\
+\sigma^2 &\sim \mathrm{InvGamma}(0.1, 0.1)
+\end{aligned}
+$$
+
+```{r, message = F}
+priors <- c(
+  set_prior("normal(0, 1)", class = 'b'),
+  set_prior("inv_gamma(0.1, 0.1)", class = "sd", group = "state"),
+  set_prior("inv_gamma(0.1, 0.1)", class = 'sd')
+)
+
+bayes_result <- brm(as.formula(best_model), data = streetrx, prior = priors,
+                    verbose = F, refresh = 0)
+```
+
+### Estimates Comparison
+
+```{r}
+
+bayes_fixed <- (summary(bayes_result)$fixed) %>%
+  select("Estimate") %>%
+  rename("Bayesian Model Esimate" = "Estimate")
+
+freq_est <- as.matrix(coef(summary(res))[,1])
+colnames(freq_est)[[1]] <- "Frequentist Model Estimate"
+
+
+
+cbind(freq_est, bayes_fixed) %>%
+  knitr::kable(caption = "Fixed effect estimates comparison", booktabs = TRUE) 
+
+bayesian_var <- rbind(summary(bayes_result)$spec_pars %>%
+  select("Estimate"),
+  summary(bayes_result)$random$state %>% select("Estimate")) %>%
+  mutate(Estimate = Estimate^2) %>%
+  rename("Bayesian Model Estimate" = "Estimate")
+
+rownames(bayesian_var) <- c("Residual", "State")
+
+frequentist_est <- as.data.frame(VarCorr(res)) %>%
+  select(1, 4) %>%
+  rename(var = vcov) %>%
+  rename("Frequentist Model Estimate" = var) %>%
+  select("Frequentist Model Estimate")
+  
+
+rownames(frequentist_est) <- c("State", "Residual")
+
+merge(bayesian_var, frequentist_est, by = "row.names") %>%
+  rename("Source of Variation" = "Row.names") %>%
+  knitr::kable(caption = "Variance estimates comparison", booktabs = TRUE)
+```
+
+From the above tables, we can see that the results given by Bayesian setting is almost the same as that from the frequentist setting.
+
+### Posterior Checks
+
+The below plots show our posterior distributions for all parameters of interest and traceplots to check that the sampling chains converged, which they did as shown below.
+```{r}
+plot(bayes_result)
+```
+
+
+## Model Diagnostics
+
+### Residual Plots
+
+```{r}
+plot(res)
+```
+
+
+```{r}
+residual <- resid(res)
+p1 <- ggplot() + 
+  geom_qq(aes(sample = residual)) +
+  geom_qq_line(aes(sample = residual)) +
+  coord_equal()
+p2 <- ggplot() +
+  geom_density(aes(x = residual))
+p1 + p2
+```
+
+### Influential Groups
+
+Table of DFBETAS
+
+```{r, error=TRUE}
+tryCatch({
+  best_model.inf <- influence(res, "state")
+  cutoff <- 2/sqrt(length(unique(streetrx$state)))
+
+  dfbetas_inf <- round(dfbetas(best_model.inf), 4)
+  above_cutoff <- apply(abs(dfbetas_inf) > cutoff, MARGIN = 1, any)
+  dfbetas_inf[above_cutoff,] %>%
+    knitr::kable(caption = "Level of influence states have on single parameter estiamtes", booktabs = TRUE) %>%
+    print()
+}, error = function(e) {
+  cat("Note: Influence analysis could not be computed for this dataset.\n")
+})
+```
+
+```{r, error=TRUE, fig.height=15, fig.width=10}
+if(exists("best_model.inf")) {
+  plot(best_model.inf,which="dfbetas",xlab="DFBETAS",ylab="State")
+}
+```
+
+
+```{r, error=TRUE, fig.height=7, fig.width=5}
+if(exists("best_model.inf") && exists("cutoff")) {
+  plot(best_model.inf,which="cook",cutoff=cutoff,
+  sort=TRUE,xlab="Cook's D",ylab="State")
+}
+```
+
